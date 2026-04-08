@@ -510,6 +510,15 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    def _should_auto_new(self, session: Session) -> bool:
+        """Check whether a session has been idle longer than the TTL."""
+        if self._session_ttl_minutes <= 0:
+            return False
+        if not session.updated_at:
+            return False
+        elapsed_s = (datetime.now() - session.updated_at).total_seconds()
+        return elapsed_s >= self._session_ttl_minutes * 60
+
     async def _auto_new(self, session_key: str) -> None:
         """Archive un-consolidated messages, clear session, inject summary."""
         session = self.sessions.get_or_create(session_key)
@@ -517,10 +526,10 @@ class AgentLoop:
         if not unconsolidated:
             return
 
+        logger.info("Auto session new for {} (idle {} min)", session_key, self._session_ttl_minutes)
+
         # Archive via existing Consolidator (writes to history.jsonl)
-        archived = await self.consolidator.archive(unconsolidated)
-        if not archived:
-            return
+        await self.consolidator.archive(unconsolidated)
 
         # Read the latest history entry as summary
         entries = self.consolidator.store.read_unprocessed_history(since_cursor=0)
@@ -560,11 +569,7 @@ class AgentLoop:
                 self.sessions.save(session)
 
             # Auto session new for system messages
-            if (
-                self._session_ttl_minutes > 0
-                and session.updated_at
-                and (datetime.now() - session.updated_at).total_seconds() >= self._session_ttl_minutes * 60
-            ):
+            if self._should_auto_new(session):
                 await self._auto_new(key)
                 session = self.sessions.get_or_create(key)
 
@@ -597,11 +602,7 @@ class AgentLoop:
             self.sessions.save(session)
 
         # --- Auto session new: reset stale sessions ---
-        if (
-            self._session_ttl_minutes > 0
-            and session.updated_at
-            and (datetime.now() - session.updated_at).total_seconds() >= self._session_ttl_minutes * 60
-        ):
+        if self._should_auto_new(session):
             await self._auto_new(key)
             session = self.sessions.get_or_create(key)
 
