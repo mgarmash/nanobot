@@ -304,3 +304,135 @@ class TestAutoNewSystemMessages:
             for m in session_after.messages
         )
         await loop.close_mcp()
+
+
+class TestAutoNewEdgeCases:
+    """Edge cases for auto session new."""
+
+    @pytest.mark.asyncio
+    async def test_auto_new_with_nothing_summary(self, tmp_path):
+        """Auto-new should not inject when archive produces '(nothing)'."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.add_message("user", "thanks")
+        session.add_message("assistant", "you're welcome")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        loop.provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(content="(nothing)", tool_calls=[])
+        )
+
+        await loop._auto_new("cli:test")
+
+        session_after = loop.sessions.get_or_create("cli:test")
+        assert len(session_after.messages) == 0
+
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_auto_new_archive_failure_still_clears(self, tmp_path):
+        """Auto-new should clear session even if LLM archive fails (raw_archive fallback)."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.add_message("user", "important data")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        loop.provider.chat_with_retry = AsyncMock(side_effect=Exception("API down"))
+
+        # Should not raise
+        await loop._auto_new("cli:test")
+
+        session_after = loop.sessions.get_or_create("cli:test")
+        # Session should still be cleared (archive falls back to raw dump)
+        # Old messages should be gone, but raw archive summary is injected
+        assert not any(m["content"] == "important data" for m in session_after.messages)
+        assert any("[Session Resumed]" in m["content"] for m in session_after.messages)
+
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_auto_new_preserves_runtime_checkpoint_before_check(self, tmp_path):
+        """Runtime checkpoint should be restored before idle check runs."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.metadata[AgentLoop._RUNTIME_CHECKPOINT_KEY] = {
+            "assistant_message": {"role": "assistant", "content": "interrupted response"},
+            "completed_tool_results": [],
+            "pending_tool_calls": [],
+        }
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        archive_called = False
+
+        async def _fake_archive(messages):
+            nonlocal archive_called
+            archive_called = True
+            return True
+
+        loop.consolidator.archive = _fake_archive
+
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="continue")
+        await loop._process_message(msg)
+
+        # The interrupted response should have been archived (checkpoint restored first)
+        assert archive_called
+
+        await loop.close_mcp()
+
+
+class TestAutoNewIntegration:
+    """End-to-end test of auto session new feature."""
+
+    @pytest.mark.asyncio
+    async def test_full_lifecycle(self, tmp_path):
+        """
+        Full lifecycle: messages -> idle -> auto-new -> archive -> clear -> summary inject -> new message processed.
+        """
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+
+        # Phase 1: User has a conversation
+        session.add_message("user", "I'm learning English, teach me past tense")
+        session.add_message("assistant", "Past tense is used for actions completed in the past...")
+        session.add_message("user", "Give me an example")
+        session.add_message("assistant", '"I walked to the store yesterday."')
+        loop.sessions.save(session)
+
+        # Phase 2: Time passes (simulate idle)
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        # Phase 3: User returns with a new message
+        loop.provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(
+                content="User is learning English past tense. Example: 'I walked to the store yesterday.'",
+                tool_calls=[],
+            )
+        )
+
+        msg = InboundMessage(
+            channel="cli", sender_id="user", chat_id="test",
+            content="Let's continue, teach me present perfect",
+        )
+        response = await loop._process_message(msg)
+
+        # Phase 4: Verify
+        session_after = loop.sessions.get_or_create("cli:test")
+
+        # Old messages should be gone
+        assert not any(
+            "past tense is used" in str(m.get("content", "")) for m in session_after.messages
+        )
+
+        # Summary should be injected
+        assert any(
+            "[Session Resumed]" in str(m.get("content", "")) for m in session_after.messages
+        )
+
+        # The new message should be processed (response exists)
+        assert response is not None
+
+        await loop.close_mcp()
