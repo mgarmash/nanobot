@@ -267,7 +267,6 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
-    tool_hint_len: int = 0
 
 
 class FeishuChannel(BaseChannel):
@@ -1287,7 +1286,6 @@ class FeishuChannel(BaseChannel):
                 # next segment appends to the same card.
                 buf = self._stream_bufs.get(chat_id)
                 if buf and buf.card_id and buf.text:
-                    buf.tool_hint_len = 0
                     buf.sequence += 1
                     await loop.run_in_executor(
                         None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence,
@@ -1297,7 +1295,6 @@ class FeishuChannel(BaseChannel):
             buf = self._stream_bufs.pop(chat_id, None)
             if not buf or not buf.text:
                 return
-            buf.tool_hint_len = 0
             if buf.card_id:
                 buf.sequence += 1
                 await loop.run_in_executor(
@@ -1333,8 +1330,6 @@ class FeishuChannel(BaseChannel):
         if buf is None:
             buf = _FeishuStreamBuf()
             self._stream_bufs[chat_id] = buf
-        if buf.tool_hint_len > 0:
-            buf.tool_hint_len = 0
         buf.text += delta
         if not buf.text.strip():
             return
@@ -1377,13 +1372,9 @@ class FeishuChannel(BaseChannel):
                     return
                 buf = self._stream_bufs.get(msg.chat_id)
                 if buf and buf.card_id:
-                    if buf.tool_hint_len > 0:
-                        buf.text = buf.text[:-buf.tool_hint_len]
                     lines = self._format_tool_hint_lines(hint).split("\n")
                     formatted = "\n".join(f"🔧 {ln}" for ln in lines if ln.strip())
-                    suffix = f"\n\n{formatted}\n\n"
-                    buf.text += suffix
-                    buf.tool_hint_len = len(suffix)
+                    buf.text += f"\n\n{formatted}\n\n"
                     buf.sequence += 1
                     await loop.run_in_executor(
                         None, self._stream_update_text_sync,
