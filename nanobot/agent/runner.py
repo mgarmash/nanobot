@@ -31,6 +31,8 @@ from nanobot.utils.runtime import (
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _MAX_EMPTY_RETRIES = 2
+_MAX_INJECTIONS_PER_TURN = 3
+_MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
 @dataclass(slots=True)
 class AgentRunSpec:
@@ -56,6 +58,7 @@ class AgentRunSpec:
     provider_retry_mode: str = "standard"
     progress_callback: Any | None = None
     checkpoint_callback: Any | None = None
+    injection_callback: Any | None = None
 
 
 @dataclass(slots=True)
@@ -69,6 +72,7 @@ class AgentRunResult:
     stop_reason: str = "completed"
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
+    had_injections: bool = False
 
 
 class AgentRunner:
@@ -76,6 +80,29 @@ class AgentRunner:
 
     def __init__(self, provider: LLMProvider):
         self.provider = provider
+
+    async def _drain_injections(self, spec: AgentRunSpec) -> list[str]:
+        """Drain pending user messages via the injection callback.
+
+        Returns up to ``_MAX_INJECTIONS_PER_TURN`` message contents, or an
+        empty list when there is nothing to inject.
+        """
+        if spec.injection_callback is None:
+            return []
+        try:
+            items = await spec.injection_callback()
+        except Exception:
+            logger.exception("injection_callback failed")
+            return []
+        if not items:
+            return []
+        # items may be raw strings or InboundMessage objects
+        texts: list[str] = []
+        for item in items:
+            text = item if isinstance(item, str) else getattr(item, "content", str(item))
+            if text.strip():
+                texts.append(text)
+        return texts[-_MAX_INJECTIONS_PER_TURN:]
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
@@ -88,6 +115,8 @@ class AgentRunner:
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
         empty_content_retries = 0
+        had_injections = False
+        injection_cycles = 0
 
         for iteration in range(spec.max_iterations):
             try:
@@ -181,6 +210,18 @@ class AgentRunner:
                     },
                 )
                 empty_content_retries = 0
+                # Checkpoint 1: drain injections after tools, before next LLM call
+                if injection_cycles < _MAX_INJECTION_CYCLES:
+                    injections = await self._drain_injections(spec)
+                    if injections:
+                        had_injections = True
+                        injection_cycles += 1
+                        for text in injections:
+                            messages.append({"role": "user", "content": text})
+                        logger.info(
+                            "Injected {} follow-up message(s) after tool execution ({}/{})",
+                            len(injections), injection_cycles, _MAX_INJECTION_CYCLES,
+                    )
                 await hook.after_iteration(context)
                 continue
 
@@ -260,6 +301,21 @@ class AgentRunner:
             context.final_content = final_content
             context.stop_reason = stop_reason
             await hook.after_iteration(context)
+            # Checkpoint 2: drain injections after final response ("last-mile").
+            # If the user sent a follow-up while the LLM was generating, continue
+            # the loop so the model can address it instead of silently dropping it.
+            if injection_cycles < _MAX_INJECTION_CYCLES:
+                injections = await self._drain_injections(spec)
+                if injections:
+                    had_injections = True
+                    injection_cycles += 1
+                    for text in injections:
+                        messages.append({"role": "user", "content": text})
+                    logger.info(
+                        "Injected {} follow-up message(s) after final response ({}/{})",
+                        len(injections), injection_cycles, _MAX_INJECTION_CYCLES,
+                    )
+                    continue
             break
         else:
             stop_reason = "max_iterations"
@@ -283,6 +339,7 @@ class AgentRunner:
             stop_reason=stop_reason,
             error=error,
             tool_events=tool_events,
+            had_injections=had_injections,
         )
 
     def _build_request_kwargs(
