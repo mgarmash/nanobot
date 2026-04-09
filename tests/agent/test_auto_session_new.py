@@ -431,6 +431,10 @@ class TestAutoNewIntegration:
         assert not any(
             "[Resumed Session]" in str(m.get("content", "")) for m in session_after.messages
         )
+        # Runtime context end marker should NOT be persisted
+        assert not any(
+            "[/Runtime Context]" in str(m.get("content", "")) for m in session_after.messages
+        )
 
         # Pending summary should be consumed (one-shot)
         assert "cli:test" not in loop._pending_summaries
@@ -438,4 +442,37 @@ class TestAutoNewIntegration:
         # The new message should be processed (response exists)
         assert response is not None
 
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_multi_paragraph_user_message_preserved(self, tmp_path):
+        """Multi-paragraph user messages must be fully preserved after auto-new."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.add_message("user", "old message")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        async def _fake_archive(messages):
+            return True
+
+        loop.consolidator.archive = _fake_archive
+
+        msg = InboundMessage(
+            channel="cli", sender_id="user", chat_id="test",
+            content="Paragraph one\n\nParagraph two\n\nParagraph three",
+        )
+        await loop._process_message(msg)
+
+        session_after = loop.sessions.get_or_create("cli:test")
+        user_msgs = [m for m in session_after.messages if m.get("role") == "user"]
+        assert len(user_msgs) >= 1
+        # All three paragraphs must be preserved
+        persisted = user_msgs[-1]["content"]
+        assert "Paragraph one" in persisted
+        assert "Paragraph two" in persisted
+        assert "Paragraph three" in persisted
+        # No runtime context markers in persisted message
+        assert "[Runtime Context" not in persisted
+        assert "[/Runtime Context]" not in persisted
         await loop.close_mcp()
