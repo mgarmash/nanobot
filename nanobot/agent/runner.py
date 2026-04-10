@@ -34,6 +34,8 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
+
+
 @dataclass(slots=True)
 class AgentRunSpec:
     """Configuration for a single agent execution."""
@@ -84,8 +86,10 @@ class AgentRunner:
     async def _drain_injections(self, spec: AgentRunSpec) -> list[str]:
         """Drain pending user messages via the injection callback.
 
-        Returns up to ``_MAX_INJECTIONS_PER_TURN`` message contents, or an
-        empty list when there is nothing to inject.
+        Returns all drained message contents (capped by
+        ``_MAX_INJECTIONS_PER_TURN``), or an empty list when there is
+        nothing to inject.  Messages beyond the cap are logged so they
+        are not silently lost.
         """
         if spec.injection_callback is None:
             return []
@@ -96,13 +100,20 @@ class AgentRunner:
             return []
         if not items:
             return []
-        # items may be raw strings or InboundMessage objects
+        # items are InboundMessage objects from _drain_pending
         texts: list[str] = []
         for item in items:
-            text = item if isinstance(item, str) else getattr(item, "content", str(item))
+            text = getattr(item, "content", str(item))
             if text.strip():
                 texts.append(text)
-        return texts[-_MAX_INJECTIONS_PER_TURN:]
+        if len(texts) > _MAX_INJECTIONS_PER_TURN:
+            dropped = len(texts) - _MAX_INJECTIONS_PER_TURN
+            logger.warning(
+                "Injection batch has {} messages, capping to {} ({} dropped)",
+                len(texts), _MAX_INJECTIONS_PER_TURN, dropped,
+            )
+            texts = texts[-_MAX_INJECTIONS_PER_TURN:]
+        return texts
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
@@ -221,7 +232,7 @@ class AgentRunner:
                         logger.info(
                             "Injected {} follow-up message(s) after tool execution ({}/{})",
                             len(injections), injection_cycles, _MAX_INJECTION_CYCLES,
-                    )
+                        )
                 await hook.after_iteration(context)
                 continue
 
@@ -257,8 +268,29 @@ class AgentRunner:
                 context.tool_calls = list(response.tool_calls)
                 clean = hook.finalize_content(context, response.content)
 
+            # Check for mid-turn injections BEFORE signaling stream end.
+            # If injections are found we keep the stream alive (resuming=True)
+            # so streaming channels don't prematurely finalize the card.
+            _injected_after_final = False
+            if injection_cycles < _MAX_INJECTION_CYCLES:
+                injections = await self._drain_injections(spec)
+                if injections:
+                    had_injections = True
+                    injection_cycles += 1
+                    _injected_after_final = True
+                    for text in injections:
+                        messages.append({"role": "user", "content": text})
+                    logger.info(
+                        "Injected {} follow-up message(s) after final response ({}/{})",
+                        len(injections), injection_cycles, _MAX_INJECTION_CYCLES,
+                    )
+
             if hook.wants_streaming():
-                await hook.on_stream_end(context, resuming=False)
+                await hook.on_stream_end(context, resuming=_injected_after_final)
+
+            if _injected_after_final:
+                await hook.after_iteration(context)
+                continue
 
             if response.finish_reason == "error":
                 final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
@@ -301,21 +333,6 @@ class AgentRunner:
             context.final_content = final_content
             context.stop_reason = stop_reason
             await hook.after_iteration(context)
-            # Checkpoint 2: drain injections after final response ("last-mile").
-            # If the user sent a follow-up while the LLM was generating, continue
-            # the loop so the model can address it instead of silently dropping it.
-            if injection_cycles < _MAX_INJECTION_CYCLES:
-                injections = await self._drain_injections(spec)
-                if injections:
-                    had_injections = True
-                    injection_cycles += 1
-                    for text in injections:
-                        messages.append({"role": "user", "content": text})
-                    logger.info(
-                        "Injected {} follow-up message(s) after final response ({}/{})",
-                        len(injections), injection_cycles, _MAX_INJECTION_CYCLES,
-                    )
-                    continue
             break
         else:
             stop_reason = "max_iterations"

@@ -445,11 +445,18 @@ class AgentLoop:
             # is processing this session), route the message there for mid-turn
             # injection instead of creating a competing task.
             if msg.session_key in self._pending_queues:
-                self._pending_queues[msg.session_key].put_nowait(msg)
-                logger.info(
-                    "Routed follow-up message to pending queue for session {}",
-                    msg.session_key,
-                )
+                try:
+                    self._pending_queues[msg.session_key].put_nowait(msg)
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "Pending queue full for session {}, dropping follow-up",
+                        msg.session_key,
+                    )
+                else:
+                    logger.info(
+                        "Routed follow-up message to pending queue for session {}",
+                        msg.session_key,
+                    )
                 continue
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -463,7 +470,7 @@ class AgentLoop:
 
         # Register a pending queue so follow-up messages for this session are
         # routed here (mid-turn injection) instead of spawning a new task.
-        pending = asyncio.Queue()
+        pending = asyncio.Queue(maxsize=20)
         self._pending_queues[session_key] = pending
 
         try:
@@ -522,7 +529,24 @@ class AgentLoop:
                         content="Sorry, I encountered an error.",
                     ))
         finally:
-            self._pending_queues.pop(session_key, None)
+            # Drain any messages still in the pending queue and re-publish
+            # them to the bus so they are processed as fresh inbound messages
+            # rather than silently lost.
+            queue = self._pending_queues.pop(session_key, None)
+            if queue is not None:
+                leftover = 0
+                while True:
+                    try:
+                        item = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    await self.bus.publish_inbound(item)
+                    leftover += 1
+                if leftover:
+                    logger.info(
+                        "Re-published {} leftover message(s) to bus for session {}",
+                        leftover, session_key,
+                    )
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
