@@ -652,3 +652,194 @@ class TestProactiveAutoNew:
 
         assert not archive_called
         await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_no_reschedule_after_successful_archive(self, tmp_path):
+        """Already-archived session should NOT be re-scheduled on subsequent ticks."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.add_message("user", "old message")
+        session.add_message("assistant", "old response")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        archive_count = 0
+
+        async def _fake_archive(messages):
+            nonlocal archive_count
+            archive_count += 1
+            return True
+
+        loop.consolidator.archive = _fake_archive
+        loop.consolidator.store._read_last_entry = lambda: {
+            "cursor": 1, "timestamp": "2026-01-01 00:00", "content": "Summary.",
+        }
+
+        # First tick: archives the session
+        await self._run_check_expired(loop)
+        assert archive_count == 1
+        assert "cli:test" in loop.auto_new._archived
+
+        # Second tick: should NOT re-schedule (already archived)
+        await self._run_check_expired(loop)
+        assert archive_count == 1  # Still 1, not re-scheduled
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_no_reschedule_after_empty_session_skip(self, tmp_path):
+        """Empty session skip should also prevent re-scheduling."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        archive_count = 0
+
+        async def _fake_archive(messages):
+            nonlocal archive_count
+            archive_count += 1
+            return True
+
+        loop.consolidator.archive = _fake_archive
+
+        # First tick: skips (no messages)
+        await self._run_check_expired(loop)
+        assert archive_count == 0
+        assert "cli:test" in loop.auto_new._archived
+
+        # Second tick: should NOT re-schedule
+        await self._run_check_expired(loop)
+        assert archive_count == 0
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_archived_cleared_on_new_message(self, tmp_path):
+        """_archived flag should be cleared when user sends a new message."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.add_message("user", "old message")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        async def _fake_archive(messages):
+            return True
+
+        loop.consolidator.archive = _fake_archive
+        loop.consolidator.store._read_last_entry = lambda: {
+            "cursor": 1, "timestamp": "2026-01-01 00:00", "content": "Summary.",
+        }
+
+        # Archive completes
+        await loop.auto_new._archive("cli:test")
+        assert "cli:test" in loop.auto_new._archived
+
+        # User sends a new message — prepare_session clears _archived
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="new msg")
+        await loop._process_message(msg)
+
+        assert "cli:test" not in loop.auto_new._archived
+        await loop.close_mcp()
+
+
+class TestSummaryPersistence:
+    """Test that summary survives restart via session metadata."""
+
+    @pytest.mark.asyncio
+    async def test_summary_persisted_in_session_metadata(self, tmp_path):
+        """After archive, _last_summary should be in session metadata."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.add_message("user", "hello")
+        session.add_message("assistant", "hi there")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        async def _fake_archive(messages):
+            return True
+
+        loop.consolidator.archive = _fake_archive
+        loop.consolidator.store._read_last_entry = lambda: {
+            "cursor": 1, "timestamp": "2026-01-01 00:00", "content": "User said hello.",
+        }
+
+        await loop.auto_new._archive("cli:test")
+
+        # Summary should be persisted in session metadata
+        session_after = loop.sessions.get_or_create("cli:test")
+        meta = session_after.metadata.get("_last_summary")
+        assert meta is not None
+        assert meta["text"] == "User said hello."
+        assert "last_active" in meta
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_summary_recovered_after_restart(self, tmp_path):
+        """Summary should be recovered from metadata when _summaries is empty (simulates restart)."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.add_message("user", "hello")
+        session.add_message("assistant", "hi there")
+        last_active = datetime.now() - timedelta(minutes=20)
+        session.updated_at = last_active
+        loop.sessions.save(session)
+
+        async def _fake_archive(messages):
+            return True
+
+        loop.consolidator.archive = _fake_archive
+        loop.consolidator.store._read_last_entry = lambda: {
+            "cursor": 1, "timestamp": "2026-01-01 00:00", "content": "User said hello.",
+        }
+
+        # Archive
+        await loop.auto_new._archive("cli:test")
+
+        # Simulate restart: clear in-memory state
+        loop.auto_new._summaries.clear()
+        loop.auto_new._archived.clear()
+        loop.sessions.invalidate("cli:test")
+
+        # prepare_session should recover summary from metadata
+        reloaded = loop.sessions.get_or_create("cli:test")
+        _, summary = loop.auto_new.prepare_session(reloaded, "cli:test")
+
+        assert summary is not None
+        assert "User said hello." in summary
+        assert "Inactive for" in summary
+        # Metadata should be cleaned up after consumption
+        assert "_last_summary" not in reloaded.metadata
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_metadata_cleanup_no_leak(self, tmp_path):
+        """_last_summary should be removed from metadata after being consumed."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        session.add_message("user", "hello")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        async def _fake_archive(messages):
+            return True
+
+        loop.consolidator.archive = _fake_archive
+        loop.consolidator.store._read_last_entry = lambda: {
+            "cursor": 1, "timestamp": "2026-01-01 00:00", "content": "Summary.",
+        }
+
+        await loop.auto_new._archive("cli:test")
+
+        # Clear in-memory to force metadata path
+        loop.auto_new._summaries.clear()
+        loop.sessions.invalidate("cli:test")
+        reloaded = loop.sessions.get_or_create("cli:test")
+
+        # First call: consumes from metadata
+        _, summary = loop.auto_new.prepare_session(reloaded, "cli:test")
+        assert summary is not None
+
+        # Second call: no summary (already consumed)
+        _, summary2 = loop.auto_new.prepare_session(reloaded, "cli:test")
+        assert summary2 is None
+        assert "_last_summary" not in reloaded.metadata
+        await loop.close_mcp()
