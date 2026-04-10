@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.auto_new import AutoSessionNew
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
@@ -210,7 +211,6 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
-        self._session_ttl_minutes = session_ttl_minutes
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
@@ -237,8 +237,6 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
-        self._pending_summaries: dict[str, str] = {}  # session_key → summary (one-shot)
-        self._archiving_keys: set[str] = set()  # sessions currently being archived
         self._session_locks: dict[str, asyncio.Lock] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
@@ -254,6 +252,11 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
+        )
+        self.auto_new = AutoSessionNew(
+            sessions=self.sessions,
+            consolidator=self.consolidator,
+            session_ttl_minutes=session_ttl_minutes,
         )
         self.dream = Dream(
             store=self.context.memory,
@@ -408,7 +411,7 @@ class AgentLoop:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
-                await self._check_expired_sessions()
+                await self.auto_new.check_expired(self._schedule_background)
                 continue
             except asyncio.CancelledError:
                 # Preserve real task cancellation so shutdown can complete cleanly.
@@ -512,65 +515,6 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
-    def _is_session_expired(self, updated_at: datetime | str | None) -> bool:
-        """Check whether an updated_at timestamp is beyond the TTL."""
-        if self._session_ttl_minutes <= 0 or not updated_at:
-            return False
-        if isinstance(updated_at, str):
-            updated_at = datetime.fromisoformat(updated_at)
-        elapsed_s = (datetime.now() - updated_at).total_seconds()
-        return elapsed_s >= self._session_ttl_minutes * 60
-
-    async def _check_expired_sessions(self) -> None:
-        """Proactively archive sessions that have been idle beyond TTL."""
-        for info in self.sessions.list_sessions():
-            key = info.get("key", "")
-            if not key or key in self._archiving_keys:
-                continue
-            if self._is_session_expired(info.get("updated_at")):
-                self._archiving_keys.add(key)
-                self._schedule_background(self._proactive_archive(key))
-
-    async def _proactive_archive(self, session_key: str) -> None:
-        """Archive an expired session in the background, store summary for next message."""
-        try:
-            summary = await self._auto_new(session_key)
-            if summary:
-                self._pending_summaries[session_key] = summary
-        except Exception:
-            logger.exception("Proactive auto-new failed for {}", session_key)
-        finally:
-            self._archiving_keys.discard(session_key)
-
-    async def _auto_new(self, session_key: str) -> str | None:
-        """Archive un-consolidated messages and clear session.
-
-        Returns the summary text (or None), caller is responsible for
-        delivering it to the next user message via runtime context.
-        """
-        session = self.sessions.get_or_create(session_key)
-        unconsolidated = session.messages[session.last_consolidated:]
-        if not unconsolidated:
-            return None
-
-        logger.info("Auto session new for {} (idle {} min)", session_key, self._session_ttl_minutes)
-
-        # Archive via existing Consolidator (writes to history.jsonl)
-        await self.consolidator.archive(unconsolidated)
-
-        # Read the latest history entry as summary
-        entries = self.consolidator.store.read_unprocessed_history(since_cursor=0)
-        summary_text = entries[-1]["content"] if entries else ""
-        if not summary_text or summary_text == "(nothing)":
-            summary_text = ""
-
-        # Clear session (same as /new)
-        session.clear()
-        self.sessions.save(session)
-        self.sessions.invalidate(session_key)
-
-        return summary_text or None
-
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -591,7 +535,7 @@ class AgentLoop:
                 self.sessions.save(session)
 
             # Reload session (proactive auto-new may have cleared it)
-            if key in self._archiving_keys or self._is_session_expired(session.updated_at):
+            if self.auto_new.needs_reload(session, key):
                 session = self.sessions.get_or_create(key)
 
             await self.consolidator.maybe_consolidate_by_tokens(session)
@@ -600,7 +544,7 @@ class AgentLoop:
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
 
             # Inject resumed-session summary as ephemeral runtime context
-            pending = self._pending_summaries.pop(key, None)
+            pending = self.auto_new.pop_summary(key)
 
             messages = self.context.build_messages(
                 history=history,
@@ -628,7 +572,7 @@ class AgentLoop:
             self.sessions.save(session)
 
         # Reload session (proactive auto-new may have cleared it)
-        if key in self._archiving_keys or self._is_session_expired(session.updated_at):
+        if self.auto_new.needs_reload(session, key):
             session = self.sessions.get_or_create(key)
 
         # Slash commands
@@ -647,7 +591,7 @@ class AgentLoop:
         history = session.get_history(max_messages=0)
 
         # Inject resumed-session summary as ephemeral runtime context (one-shot, not persisted)
-        pending = self._pending_summaries.pop(key, None)
+        pending = self.auto_new.pop_summary(key)
 
         initial_messages = self.context.build_messages(
             history=history,
