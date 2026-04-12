@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any, Literal
 
 from loguru import logger
 from pydantic import Field
-from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    ReactionTypeEmoji,
+    ReplyParameters,
+    Update,
+)
 from telegram.error import BadRequest, NetworkError, TimedOut
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -166,6 +176,157 @@ def _markdown_to_telegram_html(text: str) -> str:
         text = text.replace(f"\x00CB{i}\x00", f"<pre><code>{escaped}</code></pre>")
 
     return text
+
+
+def _calendar_agenda_buttons(day: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(text="⬅️", callback_data=f"calendar:agenda:prev:{day}"),
+                InlineKeyboardButton(text="Today", callback_data="calendar:agenda:today"),
+                InlineKeyboardButton(text="➡️", callback_data=f"calendar:agenda:next:{day}"),
+            ]
+        ]
+    )
+
+
+def _calendar_slots_buttons(day: str, duration_min: int) -> InlineKeyboardMarkup:
+    shorter = max(15, duration_min - 30)
+    longer = min(180, duration_min + 30)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(text="Agenda", callback_data=f"calendar:agenda:show:{day}"),
+                InlineKeyboardButton(text="⬅️", callback_data=f"calendar:agenda:prev:{day}"),
+                InlineKeyboardButton(text="➡️", callback_data=f"calendar:agenda:next:{day}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"{shorter}m", callback_data=f"calendar:slots:{day}:{shorter}"
+                ),
+                InlineKeyboardButton(
+                    text=f"{duration_min}m", callback_data=f"calendar:slots:{day}:{duration_min}"
+                ),
+                InlineKeyboardButton(
+                    text=f"{longer}m", callback_data=f"calendar:slots:{day}:{longer}"
+                ),
+            ],
+        ]
+    )
+
+
+def _ru_date_label(day: str) -> str:
+    d = date.fromisoformat(day)
+    return d.strftime("%d.%m.%Y")
+
+
+def _local_hhmm(iso_value: str, tz_name: str = "Asia/Yekaterinburg") -> str:
+    dt = datetime.fromisoformat(iso_value)
+    if dt.tzinfo is None:
+        return dt.strftime("%H:%M")
+    try:
+        from zoneinfo import ZoneInfo
+
+        dt = dt.astimezone(ZoneInfo(tz_name))
+    except Exception:
+        pass
+    return dt.strftime("%H:%M")
+
+
+def _calendar_today(tz_name: str = "Asia/Yekaterinburg") -> date:
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:
+        return date.today()
+
+
+def _extract_calendar_link(event: dict[str, Any]) -> str | None:
+    url = event.get("url")
+    if isinstance(url, str) and (url.startswith("http://") or url.startswith("https://")):
+        return url
+
+    location = str(event.get("location") or "").strip()
+    if location.startswith("http://") or location.startswith("https://"):
+        return location
+
+    description = str(event.get("description") or "")
+    match = re.search(r"https?://\S+", description)
+    if match:
+        return match.group(0).rstrip(").,;")
+    return None
+
+
+def _render_calendar_event_line(event: dict[str, Any]) -> str:
+    start = _local_hhmm(str(event.get("starts_at", "")))
+    end = _local_hhmm(str(event.get("ends_at", "")))
+    title = str(event.get("title", "Busy"))
+    kind = str(event.get("calendar_kind", "?"))
+    link = _extract_calendar_link(event)
+    title_rendered = f"[{title}]({link})" if link else title
+    return f"• {start}–{end} — {title_rendered} [{kind}]"
+
+
+def _detect_calendar_read_intent(text: str) -> dict[str, Any] | None:
+    normalized = " ".join(text.lower().split())
+    if not normalized:
+        return None
+
+    if "календар" in normalized:
+        if "завтра" in normalized:
+            return {"kind": "agenda", "day_offset": 1}
+        if "сегодня" in normalized:
+            return {"kind": "agenda", "day_offset": 0}
+
+    if "свободн" in normalized and "слот" in normalized:
+        duration = 30
+        m = re.search(r"(\d{2,3})\s*мин", normalized)
+        if m:
+            try:
+                duration = int(m.group(1))
+            except ValueError:
+                pass
+        if "завтра" in normalized:
+            return {"kind": "slots", "day_offset": 1, "duration_min": duration}
+        if "сегодня" in normalized:
+            return {"kind": "slots", "day_offset": 0, "duration_min": duration}
+    return None
+
+
+def _calendar_agenda_text(day: str, events: list[dict[str, Any]]) -> str:
+    lines = [f"{_ru_date_label(day)}:"]
+    seen_slots: dict[str, list[str]] = {}
+    for event in events:
+        start = _local_hhmm(str(event.get("starts_at", "")))
+        end = _local_hhmm(str(event.get("ends_at", "")))
+        title = str(event.get("title", "Busy"))
+        line = _render_calendar_event_line(event)
+        lines.append(line)
+        seen_slots.setdefault(f"{start}–{end}", []).append(title)
+
+    overlaps = []
+    for slot, titles in seen_slots.items():
+        if len(titles) <= 1:
+            continue
+        normalized_titles = {title.strip().lower() for title in titles if title.strip()}
+        if len(normalized_titles) <= 1:
+            continue
+        overlaps.append(f"• {slot} — {', '.join(titles)}")
+    if overlaps:
+        lines.append("")
+        lines.append("Пересечения:")
+        lines.extend(overlaps)
+    return "\n".join(lines)
+
+
+def _calendar_slots_text(day: str, duration: int, slots: list[dict[str, Any]]) -> str:
+    lines = [f"Свободные слоты на {_ru_date_label(day)} ({duration} мин):"]
+    for slot in slots:
+        start = _local_hhmm(str(slot.get("starts_at", "")))
+        end = _local_hhmm(str(slot.get("ends_at", "")))
+        lines.append(f"• {start}–{end}")
+    return "\n".join(lines)
 
 
 _SEND_MAX_RETRIES = 3
@@ -325,6 +486,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
 
         self._app.add_handler(MessageHandler(filters.ALL, self._on_topic_event), group=-1)
+        self._app.add_handler(CallbackQueryHandler(self._on_callback_query), group=-1)
 
         # Add message handler for text, photos, voice, documents, and locations
         self._app.add_handler(
@@ -362,7 +524,7 @@ class TelegramChannel(BaseChannel):
 
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
             drop_pending_updates=False,  # Process pending messages on startup
             error_callback=self._on_polling_error,
         )
@@ -429,6 +591,8 @@ class TelegramChannel(BaseChannel):
             return
         reply_to_message_id = msg.metadata.get("message_id")
         message_thread_id = msg.metadata.get("message_thread_id")
+        buttons = msg.metadata.get("buttons") or []
+        edit_message_id = msg.metadata.get("_edit_message_id")
         if message_thread_id is None and reply_to_message_id is not None:
             message_thread_id = self._message_threads.get((msg.chat_id, reply_to_message_id))
         thread_kwargs = {}
@@ -441,6 +605,37 @@ class TelegramChannel(BaseChannel):
                 reply_params = ReplyParameters(
                     message_id=reply_to_message_id, allow_sending_without_reply=True
                 )
+
+        reply_markup = None
+        if buttons:
+            rows = []
+            for row in buttons:
+                row_buttons = []
+                for btn in row:
+                    text = btn.get("text")
+                    data = btn.get("data")
+                    if not text or not data:
+                        continue
+                    row_buttons.append(InlineKeyboardButton(text=text, callback_data=data[:64]))
+                if row_buttons:
+                    rows.append(row_buttons)
+            if rows:
+                reply_markup = InlineKeyboardMarkup(rows)
+
+        if edit_message_id and not (msg.media or []):
+            text = msg.content or "[empty message]"
+            html = _markdown_to_telegram_html(text)
+            await self._call_with_retry(
+                self._app.bot.edit_message_text,
+                chat_id=chat_id,
+                message_id=int(edit_message_id),
+                text=html,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                **thread_kwargs,
+            )
+            return
 
         # Send media files
         for media_path in msg.media or []:
@@ -469,6 +664,7 @@ class TelegramChannel(BaseChannel):
                         chat_id=chat_id,
                         **{param: media_path},
                         reply_parameters=reply_params,
+                        reply_markup=reply_markup,
                         **thread_kwargs,
                     )
                     continue
@@ -478,6 +674,7 @@ class TelegramChannel(BaseChannel):
                         chat_id=chat_id,
                         **{param: f},
                         reply_parameters=reply_params,
+                        reply_markup=reply_markup,
                         **thread_kwargs,
                     )
             except Exception as e:
@@ -487,6 +684,7 @@ class TelegramChannel(BaseChannel):
                     chat_id=chat_id,
                     text=f"[Failed to send: {filename}]",
                     reply_parameters=reply_params,
+                    reply_markup=reply_markup,
                     **thread_kwargs,
                 )
 
@@ -500,6 +698,7 @@ class TelegramChannel(BaseChannel):
                     reply_params,
                     thread_kwargs,
                     render_as_blockquote=render_as_blockquote,
+                    reply_markup=reply_markup,
                 )
 
     async def _call_with_retry(self, fn, *args, **kwargs):
@@ -539,6 +738,7 @@ class TelegramChannel(BaseChannel):
         reply_params=None,
         thread_kwargs: dict | None = None,
         render_as_blockquote: bool = False,
+        reply_markup=None,
     ) -> None:
         """Send a plain text message with HTML fallback."""
         try:
@@ -553,6 +753,8 @@ class TelegramChannel(BaseChannel):
                 text=html,
                 parse_mode="HTML",
                 reply_parameters=reply_params,
+                reply_markup=reply_markup,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
                 **(thread_kwargs or {}),
             )
         except Exception as e:
@@ -563,6 +765,8 @@ class TelegramChannel(BaseChannel):
                     chat_id=chat_id,
                     text=text,
                     reply_parameters=reply_params,
+                    reply_markup=reply_markup,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
                     **(thread_kwargs or {}),
                 )
             except Exception as e2:
@@ -704,6 +908,137 @@ class TelegramChannel(BaseChannel):
             message, "forum_topic_edited", None
         ):
             self._remember_topic_title(message)
+
+    async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        user = update.effective_user
+        if not query or not user or not query.message:
+            return
+
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        if query.data and query.data.startswith("calendar:"):
+            await self._handle_calendar_callback(query)
+            return
+
+        message = query.message
+        self._remember_thread_context(message)
+        self._remember_topic_title(message)
+
+        sender_id = self._sender_id(user)
+        chat_id = str(message.chat_id)
+        metadata = self._build_message_metadata(message, user)
+        metadata["callback_query_id"] = query.id
+        metadata["callback_data"] = query.data
+        metadata["_ui_callback"] = True
+        metadata["_edit_message_id"] = message.message_id
+        session_key = self._derive_topic_session_key(message)
+
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=f"[Callback] {query.data}",
+            media=[],
+            metadata=metadata,
+            session_key=session_key,
+        )
+
+    async def _handle_calendar_callback(self, query) -> None:
+        if not self._callback_executor or not query.message:
+            return
+
+        payload = str(query.data or "")
+        parts = payload.split(":")
+        if len(parts) < 2:
+            return
+
+        action = parts[1]
+        text = ""
+        reply_markup = None
+
+        try:
+            if action == "agenda":
+                sub = parts[2] if len(parts) > 2 else "today"
+                if sub == "today":
+                    day = _calendar_today().isoformat()
+                elif sub in {"prev", "next"} and len(parts) > 3:
+                    base = date.fromisoformat(parts[3])
+                    day = (base + timedelta(days=-1 if sub == "prev" else 1)).isoformat()
+                elif sub == "show" and len(parts) > 3:
+                    day = parts[3]
+                else:
+                    return
+                raw = await self._callback_executor("mcp_calendar_agenda_for_day", {"day": day})
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                events = data.get("events", []) if isinstance(data, dict) else []
+                text = _calendar_agenda_text(day, events)
+                reply_markup = _calendar_agenda_buttons(day)
+
+            elif action == "slots":
+                if len(parts) < 4:
+                    return
+                day = parts[2]
+                duration = int(parts[3])
+                raw = await self._callback_executor(
+                    "mcp_calendar_free_slots_for_day", {"day": day, "duration_min": duration}
+                )
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                slots = data.get("slots", []) if isinstance(data, dict) else []
+                lines = [f"Свободные слоты на {_ru_date_label(day)} ({duration} мин):"]
+                for slot in slots:
+                    start = _local_hhmm(str(slot.get("starts_at", "")))
+                    end = _local_hhmm(str(slot.get("ends_at", "")))
+                    lines.append(f"• {start}–{end}")
+                text = "\n".join(lines)
+                reply_markup = _calendar_slots_buttons(day, duration)
+
+            elif action == "confirm":
+                kind = parts[2] if len(parts) > 2 else ""
+                if kind == "create" and len(parts) > 4:
+                    draft_token = parts[3]
+                    calendar_kind = parts[4]
+                    raw = await self._callback_executor(
+                        "mcp_calendar_confirm_create_event",
+                        {"draft_token": draft_token, "calendar_kind": calendar_kind},
+                    )
+                    data = json.loads(raw) if isinstance(raw, str) else raw
+                    event = data.get("event", {}) if isinstance(data, dict) else {}
+                    text = f"Created: {event.get('title')} ({event.get('calendar_name')})"
+                elif kind == "delete" and len(parts) > 4:
+                    event_id = parts[3]
+                    calendar_kind = parts[4]
+                    raw = await self._callback_executor(
+                        "mcp_calendar_delete_event",
+                        {"event_id": event_id, "calendar_kind": calendar_kind},
+                    )
+                    data = json.loads(raw) if isinstance(raw, str) else raw
+                    text = f"Deleted from {data.get('calendar_kind', calendar_kind)}"
+                else:
+                    return
+
+            elif action == "cancel":
+                text = "Cancelled."
+
+            else:
+                return
+
+            if not text:
+                return
+            html = _markdown_to_telegram_html(text)
+            await self._call_with_retry(
+                self._app.bot.edit_message_text,
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+                text=html,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except Exception as e:
+            logger.exception("Calendar callback routing failed: {}", e)
 
     @staticmethod
     def _sender_id(user) -> str:
@@ -988,6 +1323,52 @@ class TelegramChannel(BaseChannel):
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
+
+        if message.text and self._callback_executor:
+            intent = _detect_calendar_read_intent(message.text)
+            if intent:
+                from datetime import date, timedelta
+
+                day = (
+                    _calendar_today() + timedelta(days=int(intent.get("day_offset", 0)))
+                ).isoformat()
+                thread_kwargs = {}
+                if getattr(message, "message_thread_id", None) is not None:
+                    thread_kwargs["message_thread_id"] = message.message_thread_id
+
+                try:
+                    if intent["kind"] == "agenda":
+                        raw = await self._callback_executor(
+                            "mcp_calendar_agenda_for_day", {"day": day}
+                        )
+                        data = json.loads(raw) if isinstance(raw, str) else raw
+                        events = data.get("events", []) if isinstance(data, dict) else []
+                        text = _calendar_agenda_text(day, events)
+                        reply_markup = _calendar_agenda_buttons(day)
+                    else:
+                        duration = int(intent.get("duration_min", 30))
+                        raw = await self._callback_executor(
+                            "mcp_calendar_free_slots_for_day",
+                            {"day": day, "duration_min": duration},
+                        )
+                        data = json.loads(raw) if isinstance(raw, str) else raw
+                        slots = data.get("slots", []) if isinstance(data, dict) else []
+                        text = _calendar_slots_text(day, duration, slots)
+                        reply_markup = None
+
+                    html = _markdown_to_telegram_html(text)
+                    await self._call_with_retry(
+                        self._app.bot.send_message,
+                        chat_id=chat_id,
+                        text=html,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup,
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        **thread_kwargs,
+                    )
+                    return
+                except Exception as e:
+                    logger.exception("Deterministic calendar read routing failed: {}", e)
 
         str_chat_id = str(chat_id)
         metadata = self._build_message_metadata(message, user)
