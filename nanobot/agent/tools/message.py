@@ -3,7 +3,12 @@
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import (
+    ArraySchema,
+    ObjectSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanobot.bus.events import OutboundMessage
 
 
@@ -15,6 +20,17 @@ from nanobot.bus.events import OutboundMessage
         media=ArraySchema(
             StringSchema(""),
             description="Optional: list of file paths to attach (images, audio, documents)",
+        ),
+        buttons=ArraySchema(
+            ArraySchema(
+                ObjectSchema(
+                    text=StringSchema("Button label"),
+                    data=StringSchema("Callback payload"),
+                    required=["text", "data"],
+                ),
+                description="A row of inline buttons",
+            ),
+            description="Optional: inline button rows for interactive Telegram UI",
         ),
         required=["content"],
     )
@@ -62,18 +78,17 @@ class MessageTool(Tool):
             "Do NOT use read_file to send files — that only reads content for your own analysis."
         )
 
-    async def execute(
-        self,
-        content: str,
-        channel: str | None = None,
-        chat_id: str | None = None,
-        message_id: str | None = None,
-        media: list[str] | None = None,
-        **kwargs: Any
-    ) -> str:
+    async def execute(self, **kwargs: Any) -> str:
         from nanobot.utils.helpers import strip_think
-        content = strip_think(content)
-        
+
+        content = kwargs.get("content") or ""
+        channel = kwargs.get("channel")
+        chat_id = kwargs.get("chat_id")
+        message_id = kwargs.get("message_id")
+        media = kwargs.get("media")
+        content = strip_think(str(content))
+        buttons = kwargs.get("buttons")
+
         channel = channel or self._default_channel
         chat_id = chat_id or self._default_chat_id
         # Only inherit default message_id when targeting the same channel+chat.
@@ -99,8 +114,14 @@ class MessageTool(Tool):
             media=media or [],
             metadata={
                 "message_id": message_id,
-            } if message_id else {},
+                "buttons": buttons or [],
+            }
+            if message_id
+            else {},
         )
+
+        if not message_id and buttons:
+            msg.metadata["buttons"] = buttons
 
         try:
             await self._send_callback(msg)

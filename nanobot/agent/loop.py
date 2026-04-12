@@ -20,6 +20,7 @@ from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunSpec, AgentRunner
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.calendar_ui import CalendarUiTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -273,6 +274,7 @@ class AgentLoop:
             )
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(CalendarUiTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(
@@ -303,10 +305,14 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "calendar_ui", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    tool.set_context(
+                        channel,
+                        chat_id,
+                        *([message_id] if name in {"message", "calendar_ui"} else []),
+                    )
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -697,6 +703,9 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+        if calendar_ui_tool := self.tools.get("calendar_ui"):
+            if isinstance(calendar_ui_tool, CalendarUiTool):
+                calendar_ui_tool.start_turn()
 
         history = session.get_history(max_messages=0)
 
@@ -749,7 +758,15 @@ class AgentLoop:
         # However, if the turn falls back to the empty-final-response
         # placeholder, suppress it when the real user-visible output already
         # came from MessageTool.
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+        sent_by_message = (
+            (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn
+        )
+        sent_by_calendar_ui = (
+            (cut := self.tools.get("calendar_ui"))
+            and isinstance(cut, CalendarUiTool)
+            and cut._sent_in_turn
+        )
+        if sent_by_message or sent_by_calendar_ui:
             if not had_injections or stop_reason == "empty_final_response":
                 return None
 
