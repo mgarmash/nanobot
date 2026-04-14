@@ -329,6 +329,17 @@ def _calendar_slots_text(day: str, duration: int, slots: list[dict[str, Any]]) -
     return "\n".join(lines)
 
 
+def _parse_tool_json(raw: Any) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
+    if isinstance(raw, (dict, list)):
+        return raw, None
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw), None
+        except Exception:
+            return None, raw
+    return None, f"Unexpected tool response type: {type(raw).__name__}"
+
+
 _SEND_MAX_RETRIES = 3
 _SEND_RETRY_BASE_DELAY = 0.5  # seconds, doubled each retry
 _STREAM_EDIT_INTERVAL_DEFAULT = 0.6  # min seconds between edit_message_text calls
@@ -920,7 +931,7 @@ class TelegramChannel(BaseChannel):
         except Exception:
             pass
 
-        if query.data and query.data.startswith("calendar:"):
+        if query.data and (query.data.startswith("calendar:") or query.data.startswith("cal:")):
             await self._handle_calendar_callback(query)
             return
 
@@ -955,12 +966,37 @@ class TelegramChannel(BaseChannel):
         if len(parts) < 2:
             return
 
+        prefix = parts[0]
         action = parts[1]
         text = ""
         reply_markup = None
 
         try:
-            if action == "agenda":
+            if prefix == "cal" and action == "cc":
+                if len(parts) < 3:
+                    return
+                draft_token = parts[2]
+                raw = await self._callback_executor(
+                    "mcp_calendar_confirm_create_event",
+                    {"draft_token": draft_token},
+                )
+                data, err = _parse_tool_json(raw)
+                if err:
+                    text = f"Ошибка создания события: {err}"
+                    html = _markdown_to_telegram_html(text)
+                    await self._call_with_retry(
+                        self._app.bot.edit_message_text,
+                        chat_id=query.message.chat_id,
+                        message_id=query.message.message_id,
+                        text=html,
+                        parse_mode="HTML",
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    )
+                    return
+                event = data.get("event", {}) if isinstance(data, dict) else {}
+                text = f"Создано: {event.get('title')} ({event.get('calendar_name')})"
+
+            elif action == "agenda":
                 sub = parts[2] if len(parts) > 2 else "today"
                 if sub == "today":
                     day = _calendar_today().isoformat()
@@ -972,7 +1008,9 @@ class TelegramChannel(BaseChannel):
                 else:
                     return
                 raw = await self._callback_executor("mcp_calendar_agenda_for_day", {"day": day})
-                data = json.loads(raw) if isinstance(raw, str) else raw
+                data, err = _parse_tool_json(raw)
+                if err:
+                    raise RuntimeError(err)
                 events = data.get("events", []) if isinstance(data, dict) else []
                 text = _calendar_agenda_text(day, events)
                 reply_markup = _calendar_agenda_buttons(day)
@@ -985,7 +1023,9 @@ class TelegramChannel(BaseChannel):
                 raw = await self._callback_executor(
                     "mcp_calendar_free_slots_for_day", {"day": day, "duration_min": duration}
                 )
-                data = json.loads(raw) if isinstance(raw, str) else raw
+                data, err = _parse_tool_json(raw)
+                if err:
+                    raise RuntimeError(err)
                 slots = data.get("slots", []) if isinstance(data, dict) else []
                 lines = [f"Свободные слоты на {_ru_date_label(day)} ({duration} мин):"]
                 for slot in slots:
@@ -1004,7 +1044,19 @@ class TelegramChannel(BaseChannel):
                         "mcp_calendar_confirm_create_event",
                         {"draft_token": draft_token, "calendar_kind": calendar_kind},
                     )
-                    data = json.loads(raw) if isinstance(raw, str) else raw
+                    data, err = _parse_tool_json(raw)
+                    if err:
+                        text = f"Ошибка создания события: {err}"
+                        html = _markdown_to_telegram_html(text)
+                        await self._call_with_retry(
+                            self._app.bot.edit_message_text,
+                            chat_id=query.message.chat_id,
+                            message_id=query.message.message_id,
+                            text=html,
+                            parse_mode="HTML",
+                            link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        )
+                        return
                     event = data.get("event", {}) if isinstance(data, dict) else {}
                     text = f"Created: {event.get('title')} ({event.get('calendar_name')})"
                 elif kind == "delete" and len(parts) > 4:
@@ -1014,7 +1066,19 @@ class TelegramChannel(BaseChannel):
                         "mcp_calendar_delete_event",
                         {"event_id": event_id, "calendar_kind": calendar_kind},
                     )
-                    data = json.loads(raw) if isinstance(raw, str) else raw
+                    data, err = _parse_tool_json(raw)
+                    if err:
+                        text = f"Ошибка удаления события: {err}"
+                        html = _markdown_to_telegram_html(text)
+                        await self._call_with_retry(
+                            self._app.bot.edit_message_text,
+                            chat_id=query.message.chat_id,
+                            message_id=query.message.message_id,
+                            text=html,
+                            parse_mode="HTML",
+                            link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        )
+                        return
                     text = f"Deleted from {data.get('calendar_kind', calendar_kind)}"
                 else:
                     return

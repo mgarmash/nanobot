@@ -39,12 +39,12 @@ def _slots_buttons(day: str, duration_min: int) -> list[list[dict[str, str]]]:
     ]
 
 
-def _confirm_create_buttons(draft_token: str, calendar_kind: str) -> list[list[dict[str, str]]]:
+def _confirm_create_buttons(draft_token: str) -> list[list[dict[str, str]]]:
     return [
         [
             {
                 "text": "✅ Confirm",
-                "data": f"calendar:confirm:create:{draft_token}:{calendar_kind}",
+                "data": f"cal:cc:{draft_token}",
             },
         ],
         [
@@ -145,9 +145,9 @@ class CalendarUiTool(Tool):
                 return "Error: day is required for free_slots_day"
             buttons = _slots_buttons(str(day), duration_min)
         elif action == "confirm_create":
-            if not draft_token or not calendar_kind:
-                return "Error: draft_token and calendar_kind are required for confirm_create"
-            buttons = _confirm_create_buttons(str(draft_token), calendar_kind)
+            if not draft_token:
+                return "Error: draft_token is required for confirm_create"
+            buttons = _confirm_create_buttons(str(draft_token))
         elif action == "confirm_delete":
             if not event_id or not calendar_kind:
                 return "Error: event_id and calendar_kind are required for confirm_delete"
