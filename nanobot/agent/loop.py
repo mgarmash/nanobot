@@ -420,6 +420,11 @@ class AgentLoop:
                 progress_callback=on_progress,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
+                suppress_injections_after_ui=lambda: bool(
+                    (cut := self.tools.get("calendar_ui"))
+                    and isinstance(cut, CalendarUiTool)
+                    and cut._sent_in_turn
+                ),
             )
         )
         self._last_usage = result.usage
