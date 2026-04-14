@@ -837,6 +837,7 @@ def gateway(
         agent.dream.model = dream_cfg.model_override
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
+    from nanobot.agent.calendar_reminders import CalendarReminderRunner
     from nanobot.cron.types import CronJob, CronPayload
 
     cron.register_system_job(
@@ -849,10 +850,35 @@ def gateway(
     )
     console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
 
+    reminder_channel = os.environ.get("NANOBOT_CALENDAR_REMINDER_CHANNEL") or ""
+    reminder_chat_id = os.environ.get("NANOBOT_CALENDAR_REMINDER_CHAT_ID") or ""
+    reminder_thread_id = os.environ.get("NANOBOT_CALENDAR_REMINDER_THREAD_ID") or ""
+    reminder_lead_min = int(os.environ.get("NANOBOT_CALENDAR_REMINDER_LEAD_MIN") or "5")
+    reminder_interval_s = int(os.environ.get("NANOBOT_CALENDAR_REMINDER_INTERVAL_S") or "300")
+    reminder_runner = None
+    if reminder_channel and reminder_chat_id and reminder_thread_id:
+        reminder_state_path = config.workspace_path / "memory" / "calendar_reminders_state.json"
+        reminder_runner = CalendarReminderRunner(
+            tool_executor=agent.tools.execute,
+            outbound_sender=bus.publish_outbound,
+            state_path=reminder_state_path,
+            channel=reminder_channel,
+            chat_id=reminder_chat_id,
+            message_thread_id=reminder_thread_id,
+            timezone=config.agents.defaults.timezone,
+            lead_minutes=reminder_lead_min,
+            interval_seconds=reminder_interval_s,
+        )
+        console.print(
+            f"[green]✓[/green] Calendar reminders: every {reminder_interval_s}s to {reminder_channel}:{reminder_chat_id} thread {reminder_thread_id}"
+        )
+
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
+            if reminder_runner:
+                reminder_runner.start()
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -868,6 +894,8 @@ def gateway(
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
+            if reminder_runner:
+                reminder_runner.stop()
             agent.stop()
             await channels.stop_all()
 
